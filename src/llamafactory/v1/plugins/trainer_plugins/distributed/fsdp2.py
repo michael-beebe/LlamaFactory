@@ -381,7 +381,12 @@ class FSDP2Engine:
 
         with torch.no_grad():
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            if isinstance(grad_norm, torch.distributed._tensor.DTensor):
+            # torch 2.10 renamed torch.distributed._tensor -> torch.distributed.tensor
+            try:
+                _DTensor = torch.distributed.tensor.DTensor
+            except AttributeError:
+                _DTensor = torch.distributed._tensor.DTensor
+            if isinstance(grad_norm, _DTensor):
                 grad_norm = grad_norm.full_tensor()
 
         for param in model.parameters():
@@ -638,7 +643,10 @@ class FSDP2Engine:
         return local_dir
 
     def _copy_weights(self, param, loaded_tensor):
-        from torch.distributed._tensor import DTensor, Shard
+        try:
+            from torch.distributed.tensor import DTensor, Shard
+        except ImportError:
+            from torch.distributed._tensor import DTensor, Shard
 
         if loaded_tensor.dtype != param.dtype:
             loaded_tensor = loaded_tensor.to(param.dtype)

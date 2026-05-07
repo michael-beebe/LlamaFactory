@@ -42,6 +42,68 @@ from . import helper
 logger = logging.get_logger(__name__)
 
 
+def _build_mscclpp_meshes(current_device, strategy, timeout_sec):
+    """Build (model_device_mesh, data_device_mesh) backed by torchcomms+MSCCL++.
+
+    Both meshes are 2-D to match the standard LlamaFactory layout
+    (mp_replicate × mp_shard, dp × cp). For the common case where one
+    dimension equals the world size and the other is 1, the world-sized
+    dim is backed by a TorchComm("mscclpp", ...) and the size-1 dim is
+    backed by a degenerate per-rank TorchComm. This gives FSDP2 a valid
+    DeviceMesh whose underlying ProcessGroup routes collectives through
+    MSCCL++ (with transparent NCCL fallback for unsupported ops).
+    """
+    import os as _os
+    import torch as _torch
+    import torchcomms as _tc
+    import torchcomms.device_mesh as _tcdm
+    import mscclpp_torchcomms  # noqa: F401 — auto-registers backend .so path
+
+    local_rank = int(_os.environ["LOCAL_RANK"])
+    device = _torch.device(current_device.type, local_rank)
+
+    def _make_1d_mesh(size: int, name: str):
+        if size != helper.get_world_size():
+            raise NotImplementedError(
+                f"MSCCL++ hook only supports world-sized device meshes; "
+                f"got size={size} (world={helper.get_world_size()}, name={name})."
+            )
+        comm = _tc.new_comm("mscclpp", device, name=f"lf_{name}")
+        return _tcdm.init_device_mesh(mesh_dim_comms=(comm,), mesh_dim_names=(name,))
+
+    world = helper.get_world_size()
+
+    # Model mesh: collapse to 1-D when one dim is degenerate.
+    mp_rep, mp_shard = strategy.model_mesh_shape
+    if mp_rep == 1 and mp_shard == world:
+        model_mesh = _make_1d_mesh(mp_shard, "mp_shard")
+    elif mp_shard == 1 and mp_rep == world:
+        model_mesh = _make_1d_mesh(mp_rep, "mp_replicate")
+    else:
+        raise NotImplementedError(
+            f"MSCCL++ hook does not yet support 2-D HSDP meshes "
+            f"(mp_replicate={mp_rep}, mp_shard={mp_shard})."
+        )
+
+    # Data mesh: same collapse rule. We reuse the same world-sized comm name
+    # collision-free by appending a suffix.
+    dp, cp = strategy.data_mesh_shape
+    if dp == world and cp == 1:
+        data_mesh = _make_1d_mesh(dp, "dp")
+    elif cp == world and dp == 1:
+        data_mesh = _make_1d_mesh(cp, "cp")
+    else:
+        raise NotImplementedError(
+            f"MSCCL++ hook does not yet support 2-D data meshes (dp={dp}, cp={cp})."
+        )
+
+    logger.info_rank0(
+        f"[MSCCL++] LlamaFactory device meshes initialized via torchcomms: "
+        f"model_mesh={model_mesh}, data_mesh={data_mesh}"
+    )
+    return model_mesh, data_mesh
+
+
 class Dim(StrEnum):
     """Dimension names."""
 
@@ -147,17 +209,31 @@ class DistributedInterface:
             timeout = config.get("timeout", 18000)
 
         if self._is_distributed:
-            init_process_group(timeout=timedelta(seconds=timeout), backend=helper.get_process_group_backend())
-            self.model_device_mesh = init_device_mesh(
-                device_type=self.current_device.type,
-                mesh_shape=self.strategy.model_mesh_shape,
-                mesh_dim_names=self.strategy.model_mesh_dim_names,
-            )
-            self.data_device_mesh = init_device_mesh(
-                device_type=self.current_device.type,
-                mesh_shape=self.strategy.data_mesh_shape,
-                mesh_dim_names=self.strategy.data_mesh_dim_names,
-            )
+            # MSCCL++ TorchComms hook: when LLAMAFACTORY_USE_MSCCLPP=1, route the
+            # model/data device meshes through a torchcomms-backed ProcessGroup so
+            # FSDP2 collectives (all_gather, reduce_scatter) flow through MSCCL++
+            # instead of stock NCCL. Falls back to the standard path otherwise.
+            import os as _os
+            if _os.environ.get("LLAMAFACTORY_USE_MSCCLPP", "0") == "1":
+                self.model_device_mesh, self.data_device_mesh = _build_mscclpp_meshes(
+                    self.current_device,
+                    self.strategy,
+                    timeout_sec=timeout,
+                )
+            else:
+                init_process_group(
+                    timeout=timedelta(seconds=timeout), backend=helper.get_process_group_backend()
+                )
+                self.model_device_mesh = init_device_mesh(
+                    device_type=self.current_device.type,
+                    mesh_shape=self.strategy.model_mesh_shape,
+                    mesh_dim_names=self.strategy.model_mesh_dim_names,
+                )
+                self.data_device_mesh = init_device_mesh(
+                    device_type=self.current_device.type,
+                    mesh_shape=self.strategy.data_mesh_shape,
+                    mesh_dim_names=self.strategy.data_mesh_dim_names,
+                )
         else:
             self.model_device_mesh = None
             self.data_device_mesh = None
@@ -179,9 +255,16 @@ class DistributedInterface:
         elif not self._is_distributed:
             return None
         elif dim in self.strategy.data_mesh_dim_names:
-            return self.data_device_mesh[dim.value]
+            mesh = self.data_device_mesh
         else:
-            return self.model_device_mesh[dim.value]
+            mesh = self.model_device_mesh
+        # The MSCCL++ hook collapses degenerate (size-1) dims so the mesh
+        # may be 1-D with a single-named dim. If the requested dim is the
+        # collapsed one (size 1), return the whole mesh — every collective
+        # on it is a no-op anyway.
+        if mesh.mesh_dim_names is not None and dim.value not in mesh.mesh_dim_names:
+            return mesh
+        return mesh[dim.value]
 
     def get_group(self, dim: Dim | None = None) -> Optional[ProcessGroup]:
         """Get process group for specified dimension."""

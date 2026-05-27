@@ -175,6 +175,17 @@ maybe_run mscclpp          "mscclpp"
 if [[ ${#FAILED_RUNS[@]} -gt 0 ]]; then
     echo
     echo "WARNING: the following runs FAILED (see per-run stderr.log): ${FAILED_RUNS[*]}"
+    for label in "${FAILED_RUNS[@]}"; do
+        if [[ "${label}" == "nccl_torchcomms" ]]; then
+            echo
+            echo "  nccl_torchcomms is known to fail on this system with"
+            echo "  'RuntimeError: bad_weak_ptr' on the very first torchcomms"
+            echo "  all_reduce. This is a bug in the torchcomms NCCL backend"
+            echo "  binary itself, not in LlamaFactory or this bench harness."
+            echo "  See bench/README.md (\"Known limitations\") for the minimal"
+            echo "  repro and workarounds. Use SKIP_NCCL_TORCHCOMMS=1 to skip it."
+        fi
+    done
 fi
 
 # Parse + plot

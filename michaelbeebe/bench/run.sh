@@ -2,15 +2,22 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 #
-# Benchmark runner: stock NCCL vs MSCCL++ via TorchComms on the same FSDP2
-# training config. Produces a self-contained run directory with raw per-rank
-# stderr logs, training stdout, parsed JSON metrics, and PNG figures.
+# Benchmark runner: stock NCCL vs NCCL-via-TorchComms vs MSCCL++-via-TorchComms
+# on the same FSDP2 training config. Produces a self-contained run directory
+# with raw per-rank stderr logs, training stdout, parsed JSON metrics, and PNG
+# figures.
+#
+# The three-way comparison isolates:
+#   nccl_baseline   vs nccl_torchcomms : pure TorchComms shim overhead
+#   nccl_torchcomms vs mscclpp         : MSCCL++ algorithm benefit
+#   nccl_baseline   vs mscclpp         : total real-world impact
 #
 # Usage:
 #   ./bench/run.sh                                   # 8 GPUs, default config
 #   NPROC=2 ./bench/run.sh                           # 2 GPUs
 #   STEPS=20 WARMUP=5 ./bench/run.sh                 # custom step counts
 #   CONFIG=examples/v1/train_full/train_full_fsdp2.yaml ./bench/run.sh
+#   SKIP_NCCL_TORCHCOMMS=1 ./bench/run.sh            # skip the middle control run
 #
 # Required env (auto-detected if possible):
 #   TORCHCOMMS_BACKEND_LIB_PATH_MSCCLPP  path to _comms_mscclpp.*.so
@@ -27,6 +34,20 @@ WARMUP="${WARMUP:-5}"
 CONFIG="${CONFIG:-examples/v1/train_full/train_full_fsdp2.yaml}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${RUNS_ROOT}/${TIMESTAMP}_n${NPROC}_s${STEPS}"
+
+# Optional: path to libmscclpp_nccl.so (the LD_PRELOAD NCCL drop-in shim).
+# When provided, a third 'mscclpp_shim' run is added to the comparison.
+# Auto-detect from a sibling mscclpp build dir if not set.
+if [[ -z "${MSCCLPP_NCCL_SHIM:-}" ]]; then
+    for cand in \
+        "${REPO_ROOT}/../build/cp310-cp310-linux_x86_64/lib/libmscclpp_nccl.so" \
+        "${REPO_ROOT}/../build-torchcomm/lib/libmscclpp_nccl.so"; do
+        if [[ -f "${cand}" ]]; then
+            MSCCLPP_NCCL_SHIM="$(realpath "${cand}")"
+            break
+        fi
+    done
+fi
 
 mkdir -p "${RUN_DIR}"
 
@@ -53,13 +74,15 @@ echo
 
 run_one() {
     local label="$1"
-    local enable="$2"
+    # Backend selector: "" → plain torch.distributed NCCL (no torchcomms);
+    #                   "nccl"|"mscclpp" → torchcomms with that backend.
+    local backend="$2"
     local out_dir="${RUN_DIR}/${label}"
     mkdir -p "${out_dir}/per_rank"
 
-    echo "== Running: ${label} =="
+    echo "== Running: ${label} (backend=${backend:-stock-nccl}) =="
     # Override max_steps from CLI; trace is always on so we can parse algo selection.
-    LLAMAFACTORY_USE_MSCCLPP="${enable}" \
+    LLAMAFACTORY_TORCHCOMMS_BACKEND="${backend}" \
     MSCCLPP_TORCHCOMMS_TRACE=1 \
     BENCH_TIMING_PATH="${out_dir}/step_timings.jsonl" \
     PYTHONPATH="${BENCH_DIR}/..:${PYTHONPATH:-}" \
@@ -81,8 +104,11 @@ run_one() {
 
 cd "${REPO_ROOT}"
 
-run_one nccl_baseline 0
-run_one mscclpp        1
+run_one nccl_baseline    ""
+if [[ "${SKIP_NCCL_TORCHCOMMS:-0}" != "1" ]]; then
+    run_one nccl_torchcomms  "nccl"
+fi
+run_one mscclpp          "mscclpp"
 
 # Parse + plot
 echo

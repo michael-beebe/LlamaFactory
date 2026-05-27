@@ -1,14 +1,15 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Parse stock-NCCL vs MSCCL++ benchmark logs into a single results.json.
+"""Parse stock-NCCL vs NCCL-via-TorchComms vs MSCCL++ benchmark logs into a
+single results.json.
 
-For each run (nccl_baseline/, mscclpp/) extracts:
+For each run (nccl_baseline/, nccl_torchcomms/, mscclpp/) extracts:
   - Per-step elapsed time (derived from logging-callback timestamps).
   - Per-rank collective dispatch counts and bytes, broken out by:
       - native MSCCL++ algorithms (logged as "[MSCCLPP] rank=... algo=...")
       - NCCL fallback path        (logged as "[NcclFallback] op -> NCCL ...")
-  - Loss values per step (sanity check that both runs trained equivalently).
+  - Loss values per step (sanity check that runs trained equivalently).
 """
 
 from __future__ import annotations
@@ -165,6 +166,9 @@ def summarize_step_times(rows: list[dict], warmup: int) -> dict:
     }
 
 
+RUN_LABELS = ("nccl_baseline", "nccl_torchcomms", "mscclpp")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run-dir", required=True, type=Path)
@@ -172,7 +176,7 @@ def main():
     args = p.parse_args()
 
     results = {"warmup": args.warmup, "runs": {}}
-    for label in ("nccl_baseline", "mscclpp"):
+    for label in RUN_LABELS:
         run_dir = args.run_dir / label
         if not run_dir.exists():
             print(f"  SKIP {label}: missing")
@@ -194,13 +198,24 @@ def main():
     out.write_text(json.dumps(results, indent=2, default=str))
     print(f"\n  wrote {out}")
 
-    # Side-by-side delta if both runs present.
-    if "nccl_baseline" in results["runs"] and "mscclpp" in results["runs"]:
-        a = results["runs"]["nccl_baseline"]["timing_summary"]
-        b = results["runs"]["mscclpp"]["timing_summary"]
-        if a.get("n") and b.get("n"):
-            delta = (b["median_sec"] - a["median_sec"]) / a["median_sec"] * 100
-            print(f"\n  median step time delta (mscclpp vs nccl): {delta:+.2f}%")
+    # Pairwise step-time deltas across whichever runs are present.
+    # baseline ↔ each other run (negative = faster than baseline).
+    def _delta(a_label: str, b_label: str) -> None:
+        runs = results["runs"]
+        if a_label not in runs or b_label not in runs:
+            return
+        a = runs[a_label]["timing_summary"]
+        b = runs[b_label]["timing_summary"]
+        if not (a.get("n") and b.get("n")):
+            return
+        delta = (b["median_sec"] - a["median_sec"]) / a["median_sec"] * 100
+        speedup = a["median_sec"] / b["median_sec"] if b["median_sec"] > 0 else float("nan")
+        print(f"  median step time: {b_label} vs {a_label}: {delta:+.2f}%  (rel-speed={speedup:.3f}x)")
+
+    print()
+    _delta("nccl_baseline", "nccl_torchcomms")  # TorchComms shim cost
+    _delta("nccl_torchcomms", "mscclpp")        # MSCCL++ algo benefit (apples-to-apples)
+    _delta("nccl_baseline", "mscclpp")          # total impact
 
 
 if __name__ == "__main__":

@@ -42,22 +42,37 @@ from . import helper
 logger = logging.get_logger(__name__)
 
 
-def _build_mscclpp_meshes(current_device, strategy, timeout_sec):
-    """Build (model_device_mesh, data_device_mesh) backed by torchcomms+MSCCL++.
+def _build_torchcomms_meshes(backend, current_device, strategy, timeout_sec):
+    """Build (model_device_mesh, data_device_mesh) backed by torchcomms.
 
     Both meshes are 2-D to match the standard LlamaFactory layout
     (mp_replicate × mp_shard, dp × cp). For the common case where one
     dimension equals the world size and the other is 1, the world-sized
-    dim is backed by a TorchComm("mscclpp", ...) and the size-1 dim is
+    dim is backed by a TorchComm(<backend>, ...) and the size-1 dim is
     backed by a degenerate per-rank TorchComm. This gives FSDP2 a valid
     DeviceMesh whose underlying ProcessGroup routes collectives through
-    MSCCL++ (with transparent NCCL fallback for unsupported ops).
+    the chosen backend.
+
+    Supported ``backend`` values:
+      * ``"mscclpp"`` — MSCCL++ algorithms with transparent NCCL fallback for
+        unsupported ops. Auto-registers ``mscclpp_torchcomms`` so the .so
+        path is known to torchcomms before ``new_comm`` is called.
+      * ``"nccl"`` — NCCL via torchcomms. Useful as a control run that
+        isolates the cost of routing through the torchcomms shim from the
+        cost/benefit of the MSCCL++ algorithms themselves.
     """
     import os as _os
     import torch as _torch
     import torchcomms as _tc
     import torchcomms.device_mesh as _tcdm
-    import mscclpp_torchcomms  # noqa: F401 — auto-registers backend .so path
+
+    if backend == "mscclpp":
+        import mscclpp_torchcomms  # noqa: F401 — auto-registers backend .so path
+    elif backend != "nccl":
+        raise ValueError(
+            f"Unsupported torchcomms backend for LlamaFactory hook: {backend!r}. "
+            f"Expected one of {{'mscclpp', 'nccl'}}."
+        )
 
     local_rank = int(_os.environ["LOCAL_RANK"])
     device = _torch.device(current_device.type, local_rank)
@@ -65,10 +80,10 @@ def _build_mscclpp_meshes(current_device, strategy, timeout_sec):
     def _make_1d_mesh(size: int, name: str):
         if size != helper.get_world_size():
             raise NotImplementedError(
-                f"MSCCL++ hook only supports world-sized device meshes; "
+                f"torchcomms hook only supports world-sized device meshes; "
                 f"got size={size} (world={helper.get_world_size()}, name={name})."
             )
-        comm = _tc.new_comm("mscclpp", device, name=f"lf_{name}")
+        comm = _tc.new_comm(backend, device, name=f"lf_{backend}_{name}")
         return _tcdm.init_device_mesh(mesh_dim_comms=(comm,), mesh_dim_names=(name,))
 
     world = helper.get_world_size()
@@ -81,7 +96,7 @@ def _build_mscclpp_meshes(current_device, strategy, timeout_sec):
         model_mesh = _make_1d_mesh(mp_rep, "mp_replicate")
     else:
         raise NotImplementedError(
-            f"MSCCL++ hook does not yet support 2-D HSDP meshes "
+            f"torchcomms hook does not yet support 2-D HSDP meshes "
             f"(mp_replicate={mp_rep}, mp_shard={mp_shard})."
         )
 
@@ -94,11 +109,11 @@ def _build_mscclpp_meshes(current_device, strategy, timeout_sec):
         data_mesh = _make_1d_mesh(cp, "cp")
     else:
         raise NotImplementedError(
-            f"MSCCL++ hook does not yet support 2-D data meshes (dp={dp}, cp={cp})."
+            f"torchcomms hook does not yet support 2-D data meshes (dp={dp}, cp={cp})."
         )
 
     logger.info_rank0(
-        f"[MSCCL++] LlamaFactory device meshes initialized via torchcomms: "
+        f"[torchcomms:{backend}] LlamaFactory device meshes initialized: "
         f"model_mesh={model_mesh}, data_mesh={data_mesh}"
     )
     return model_mesh, data_mesh
@@ -209,13 +224,20 @@ class DistributedInterface:
             timeout = config.get("timeout", 18000)
 
         if self._is_distributed:
-            # MSCCL++ TorchComms hook: when LLAMAFACTORY_USE_MSCCLPP=1, route the
-            # model/data device meshes through a torchcomms-backed ProcessGroup so
-            # FSDP2 collectives (all_gather, reduce_scatter) flow through MSCCL++
-            # instead of stock NCCL. Falls back to the standard path otherwise.
+            # torchcomms hook: when LLAMAFACTORY_TORCHCOMMS_BACKEND is set, route
+            # the model/data device meshes through a torchcomms-backed
+            # ProcessGroup so FSDP2 collectives (all_gather, reduce_scatter) flow
+            # through the chosen backend instead of stock NCCL. The legacy
+            # LLAMAFACTORY_USE_MSCCLPP=1 flag is preserved as an alias for
+            # LLAMAFACTORY_TORCHCOMMS_BACKEND=mscclpp. Falls back to the standard
+            # init_process_group path when neither is set.
             import os as _os
-            if _os.environ.get("LLAMAFACTORY_USE_MSCCLPP", "0") == "1":
-                self.model_device_mesh, self.data_device_mesh = _build_mscclpp_meshes(
+            tc_backend = _os.environ.get("LLAMAFACTORY_TORCHCOMMS_BACKEND", "").strip().lower()
+            if not tc_backend and _os.environ.get("LLAMAFACTORY_USE_MSCCLPP", "0") == "1":
+                tc_backend = "mscclpp"
+            if tc_backend:
+                self.model_device_mesh, self.data_device_mesh = _build_torchcomms_meshes(
+                    tc_backend,
                     self.current_device,
                     self.strategy,
                     timeout_sec=timeout,
@@ -258,7 +280,7 @@ class DistributedInterface:
             mesh = self.data_device_mesh
         else:
             mesh = self.model_device_mesh
-        # The MSCCL++ hook collapses degenerate (size-1) dims so the mesh
+        # The torchcomms hook collapses degenerate (size-1) dims so the mesh
         # may be 1-D with a single-named dim. If the requested dim is the
         # collapsed one (size 1), return the whole mesh — every collective
         # on it is a no-op anyway.

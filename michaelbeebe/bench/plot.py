@@ -23,8 +23,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-PALETTE = {"nccl_baseline": "#888888", "mscclpp": "#0078D4"}
-LABELS = {"nccl_baseline": "Stock NCCL", "mscclpp": "MSCCL++ (TorchComms)"}
+PALETTE = {
+    "nccl_baseline": "#888888",
+    "nccl_torchcomms": "#D29922",  # amber — TorchComms control
+    "mscclpp": "#0078D4",
+}
+LABELS = {
+    "nccl_baseline": "Stock NCCL",
+    "nccl_torchcomms": "NCCL (TorchComms)",
+    "mscclpp": "MSCCL++ (TorchComms)",
+}
+RUN_ORDER = ("nccl_baseline", "nccl_torchcomms", "mscclpp")
 
 
 def per_step_dts(run):
@@ -45,7 +54,7 @@ def plot_step_time_violin(run_dir: Path, results: dict):
     runs = results["runs"]
     warmup = results["warmup"]
     data, labels, colors = [], [], []
-    for k in ("nccl_baseline", "mscclpp"):
+    for k in RUN_ORDER:
         if k not in runs:
             continue
         dts_ms = [d * 1000 for d in per_step_dts_post_warmup(runs[k], warmup)]
@@ -74,7 +83,7 @@ def plot_step_time_violin(run_dir: Path, results: dict):
 def plot_step_time_series(run_dir: Path, results: dict):
     runs = results["runs"]
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    for k in ("nccl_baseline", "mscclpp"):
+    for k in RUN_ORDER:
         if k not in runs:
             continue
         rows = [r for r in runs[k]["step_metrics"] if r.get("dt_sec") is not None]
@@ -94,34 +103,49 @@ def plot_step_time_series(run_dir: Path, results: dict):
 
 
 def plot_throughput_bar(run_dir: Path, results: dict):
-    """Throughput bar: median step time → relative speedup."""
+    """Throughput bar: median step time across all runs present + pairwise deltas."""
     runs = results["runs"]
-    if "nccl_baseline" not in runs or "mscclpp" not in runs:
-        return
-    a = runs["nccl_baseline"]["timing_summary"]
-    b = runs["mscclpp"]["timing_summary"]
-    if not (a.get("n") and b.get("n")):
+    present = [k for k in RUN_ORDER if k in runs and runs[k]["timing_summary"].get("n")]
+    if len(present) < 2:
         return
 
-    # Relative throughput (1.0 = baseline).
-    rel = a["median_sec"] / b["median_sec"] if b["median_sec"] > 0 else 0
-    fig, ax = plt.subplots(figsize=(6, 4.5))
+    medians_ms = [runs[k]["timing_summary"]["median_sec"] * 1000 for k in present]
+    p10_err = [
+        (runs[k]["timing_summary"]["median_sec"] - runs[k]["timing_summary"]["p10_sec"]) * 1000
+        for k in present
+    ]
+    p90_err = [
+        (runs[k]["timing_summary"]["p90_sec"] - runs[k]["timing_summary"]["median_sec"]) * 1000
+        for k in present
+    ]
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.8))
     bars = ax.bar(
-        [LABELS["nccl_baseline"], LABELS["mscclpp"]],
-        [a["median_sec"] * 1000, b["median_sec"] * 1000],
-        color=[PALETTE["nccl_baseline"], PALETTE["mscclpp"]],
-        yerr=[
-            [(a["median_sec"] - a["p10_sec"]) * 1000, (b["median_sec"] - b["p10_sec"]) * 1000],
-            [(a["p90_sec"] - a["median_sec"]) * 1000, (b["p90_sec"] - b["median_sec"]) * 1000],
-        ],
+        [LABELS[k] for k in present],
+        medians_ms,
+        color=[PALETTE[k] for k in present],
+        yerr=[p10_err, p90_err],
         capsize=8,
     )
-    for bar, val in zip(bars, [a["median_sec"] * 1000, b["median_sec"] * 1000]):
+    for bar, val in zip(bars, medians_ms):
         ax.text(bar.get_x() + bar.get_width() / 2, val, f"{val:.0f} ms",
                 ha="center", va="bottom", fontsize=11)
     ax.set_ylabel("Median step time (ms)")
-    delta_pct = (b["median_sec"] - a["median_sec"]) / a["median_sec"] * 100
-    ax.set_title(f"Median step time  (MSCCL++ vs NCCL: {delta_pct:+.1f}%, rel-speed={rel:.2f}x)")
+
+    # Title: most informative pairwise delta = vs baseline if available.
+    if "nccl_baseline" in present:
+        a = runs["nccl_baseline"]["timing_summary"]
+        deltas = []
+        for k in present:
+            if k == "nccl_baseline":
+                continue
+            b = runs[k]["timing_summary"]
+            d = (b["median_sec"] - a["median_sec"]) / a["median_sec"] * 100
+            rel = a["median_sec"] / b["median_sec"] if b["median_sec"] > 0 else 0
+            deltas.append(f"{LABELS[k]}: {d:+.1f}% ({rel:.2f}x)")
+        ax.set_title("Median step time vs stock NCCL — " + "  |  ".join(deltas))
+    else:
+        ax.set_title("Median step time")
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(run_dir / "throughput_bar.png", dpi=150)
@@ -136,7 +160,7 @@ def plot_collectives_breakdown(run_dir: Path, results: dict):
     # Aggregate categories: native algos (named) + fallback ops (named).
     all_categories = set()
     per_run_counts = {}
-    for k in ("nccl_baseline", "mscclpp"):
+    for k in RUN_ORDER:
         if k not in runs:
             continue
         s = runs[k]["collectives"]["summary"]
@@ -156,7 +180,7 @@ def plot_collectives_breakdown(run_dir: Path, results: dict):
         return
 
     cats = sorted(all_categories)
-    runs_present = list(per_run_counts.keys())
+    runs_present = [k for k in RUN_ORDER if k in per_run_counts]
     x = np.arange(len(runs_present))
     width = 0.7
 
@@ -195,7 +219,7 @@ def plot_collectives_breakdown(run_dir: Path, results: dict):
 def plot_loss_curves(run_dir: Path, results: dict):
     runs = results["runs"]
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    for k in ("nccl_baseline", "mscclpp"):
+    for k in RUN_ORDER:
         if k not in runs:
             continue
         pairs = step_loss_pairs(runs[k])

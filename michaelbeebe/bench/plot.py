@@ -23,6 +23,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+# Default to 300dpi so plots stay readable when rendered by terminal image
+# viewers (chafa, viu, timg) — at 150dpi the matplotlib labels collapse into
+# illegible mush at any reasonable cell size. Overridable via --dpi.
+DEFAULT_DPI = 300
+
 PALETTE = {
     "nccl_baseline": "#888888",
     "nccl_torchcomms": "#D29922",  # amber — TorchComms control
@@ -50,7 +55,7 @@ def step_loss_pairs(run):
     return [(r["step"], r["loss"]) for r in run["step_metrics"]]
 
 
-def plot_step_time_violin(run_dir: Path, results: dict):
+def plot_step_time_violin(run_dir: Path, results: dict, dpi: int):
     runs = results["runs"]
     warmup = results["warmup"]
     data, labels, colors = [], [], []
@@ -76,11 +81,11 @@ def plot_step_time_violin(run_dir: Path, results: dict):
     ax.set_title(f"Step-time distribution (warmup={warmup} excluded)")
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    fig.savefig(run_dir / "step_time_violin.png", dpi=150)
+    fig.savefig(run_dir / "step_time_violin.png", dpi=dpi)
     plt.close(fig)
 
 
-def plot_step_time_series(run_dir: Path, results: dict):
+def plot_step_time_series(run_dir: Path, results: dict, dpi: int):
     runs = results["runs"]
     fig, ax = plt.subplots(figsize=(8, 4.5))
     for k in RUN_ORDER:
@@ -98,11 +103,11 @@ def plot_step_time_series(run_dir: Path, results: dict):
     ax.legend()
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig(run_dir / "step_time_series.png", dpi=150)
+    fig.savefig(run_dir / "step_time_series.png", dpi=dpi)
     plt.close(fig)
 
 
-def plot_throughput_bar(run_dir: Path, results: dict):
+def plot_throughput_bar(run_dir: Path, results: dict, dpi: int):
     """Throughput bar: median step time across all runs present + pairwise deltas."""
     runs = results["runs"]
     present = [k for k in RUN_ORDER if k in runs and runs[k]["timing_summary"].get("n")]
@@ -148,11 +153,11 @@ def plot_throughput_bar(run_dir: Path, results: dict):
         ax.set_title("Median step time")
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    fig.savefig(run_dir / "throughput_bar.png", dpi=150)
+    fig.savefig(run_dir / "throughput_bar.png", dpi=dpi)
     plt.close(fig)
 
 
-def plot_collectives_breakdown(run_dir: Path, results: dict):
+def plot_collectives_breakdown(run_dir: Path, results: dict, dpi: int):
     """Stacked-bar: count of collective ops on rank 0 by category, per run."""
     runs = results["runs"]
     if not runs:
@@ -212,11 +217,11 @@ def plot_collectives_breakdown(run_dir: Path, results: dict):
     ax.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0), fontsize=8)
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    fig.savefig(run_dir / "collectives_breakdown.png", dpi=150, bbox_inches="tight")
+    fig.savefig(run_dir / "collectives_breakdown.png", dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
 
-def plot_loss_curves(run_dir: Path, results: dict):
+def plot_loss_curves(run_dir: Path, results: dict, dpi: int):
     runs = results["runs"]
     fig, ax = plt.subplots(figsize=(8, 4.5))
     for k in RUN_ORDER:
@@ -233,22 +238,29 @@ def plot_loss_curves(run_dir: Path, results: dict):
     ax.legend()
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig(run_dir / "loss_curves.png", dpi=150)
+    fig.savefig(run_dir / "loss_curves.png", dpi=dpi)
     plt.close(fig)
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run-dir", required=True, type=Path)
+    p.add_argument(
+        "--dpi",
+        type=int,
+        default=DEFAULT_DPI,
+        help=f"Output PNG DPI (default {DEFAULT_DPI}; bump higher if you need "
+        "tiny axis labels to stay legible under terminal image renderers).",
+    )
     args = p.parse_args()
     results = json.loads((args.run_dir / "results.json").read_text())
 
-    plot_step_time_violin(args.run_dir, results)
-    plot_step_time_series(args.run_dir, results)
-    plot_throughput_bar(args.run_dir, results)
-    plot_collectives_breakdown(args.run_dir, results)
-    plot_loss_curves(args.run_dir, results)
-    print(f"  wrote PNGs under {args.run_dir}")
+    plot_step_time_violin(args.run_dir, results, args.dpi)
+    plot_step_time_series(args.run_dir, results, args.dpi)
+    plot_throughput_bar(args.run_dir, results, args.dpi)
+    plot_collectives_breakdown(args.run_dir, results, args.dpi)
+    plot_loss_curves(args.run_dir, results, args.dpi)
+    print(f"  wrote PNGs under {args.run_dir} (dpi={args.dpi})")
 
 
 if __name__ == "__main__":

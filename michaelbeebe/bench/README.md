@@ -78,6 +78,21 @@ export TORCHCOMMS_BACKEND_LIB_PATH_MSCCLPP=/path/to/_comms_mscclpp.*.so
                   tallies from the training logs into `results.json`
 - `plot.py`     — generates PNG figures from `results.json`
 
+## Known limitations
+
+- **`nccl_torchcomms` may fail with `bad_weak_ptr` on FSDP2 grad-norm warmup**
+  when using the OSS torchcomms wheel's NCCL backend with current PyTorch.
+  This is a known incompatibility between torchcomms's `_BackendWrapper`
+  NCCL path and `torch.ops._c10d_functional.all_reduce` resolution during
+  DTensor `Partial` reduction. The two runs that we know work — `nccl_baseline`
+  (stock `torch.distributed` NCCL) and `mscclpp` (TorchComms+MSCCL++) — still
+  give a valid total-impact A/B. The middle `nccl_torchcomms` run is what
+  would let you separate "TorchComms shim cost" from "MSCCL++ algorithm
+  benefit"; until the upstream bug is fixed, set `SKIP_NCCL_TORCHCOMMS=1`
+  to skip it. The run.sh harness tolerates individual run failures and
+  prints a `WARNING` listing them at the end, so a failed
+  `nccl_torchcomms` no longer aborts the rest of the comparison.
+
 ## Notes
 
 - MSCCL++ trace is always on during the bench (it's gated by env var, near-zero

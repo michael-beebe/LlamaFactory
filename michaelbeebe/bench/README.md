@@ -80,40 +80,11 @@ export TORCHCOMMS_BACKEND_LIB_PATH_MSCCLPP=/path/to/_comms_mscclpp.*.so
 
 ## Known limitations
 
-### `nccl_torchcomms` currently fails with `RuntimeError: bad_weak_ptr`
-
-The torchcomms NCCL backend (the `_comms_nccl.cpython-310-x86_64-linux-gnu.so`
-that ships in this mscclpp tree, and the one that comes with the OSS torchcomms
-wheel) hits a `bad_weak_ptr` on the **very first** `TorchComm.all_reduce`
-call, before any LlamaFactory or FSDP2 code is involved.
-
-Minimal repro on this system:
-
-```bash
-# 2-GPU smoke test, no FSDP2, no LlamaFactory:
-torchrun --nproc_per_node=2 -c '
-import os, torch, torchcomms
-torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-comm = torchcomms.new_comm("nccl", device, name="x")
-t = torch.zeros(4, device=device)
-comm.all_reduce(t, torchcomms.ReduceOp.SUM, False).wait()  # crashes here
-'
-```
-
-The same script with `"mscclpp"` instead of `"nccl"` succeeds, so the bug is
-purely in the torchcomms NCCL backend build, not in mscclpp, torchcomms's
-device-mesh wrapper, or LlamaFactory.
-
-Until the upstream torchcomms NCCL backend is rebuilt without this bug:
-
-- The full three-way A/B/C comparison cannot be performed.
-- The `nccl_baseline` ↔ `mscclpp` two-way comparison still works and gives a
-  valid **total real-world impact** number. Use `SKIP_NCCL_TORCHCOMMS=1` to
-  skip the broken run.
-- The harness tolerates the failure: `nccl_torchcomms` returns a non-zero
-  exit, the script prints a `WARNING` listing failed runs, and parse/plot
-  still emit metrics + PNGs for whichever runs did succeed.
+(none currently — the previous `nccl_torchcomms` `bad_weak_ptr` issue was
+fixed by rebuilding the torchcomms NCCL backend .so with a keep-alive
+wrapper around `std::enable_shared_from_this`. See the mscclpp repo at
+`python/mscclpp_torchcomms/csrc/NcclDynamicLoader.cpp` and commit
+`59e95c73` for the full diagnosis and fix.)
 
 ## Notes
 

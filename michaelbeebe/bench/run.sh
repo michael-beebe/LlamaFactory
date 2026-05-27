@@ -17,6 +17,7 @@
 #   NPROC=2 ./bench/run.sh                           # 2 GPUs
 #   STEPS=20 WARMUP=5 ./bench/run.sh                 # custom step counts
 #   CONFIG=examples/v1/train_full/train_full_fsdp2.yaml ./bench/run.sh
+#   SKIP_NCCL_BASELINE=1 ./bench/run.sh              # only the two torchcomms runs
 #   SKIP_NCCL_TORCHCOMMS=1 ./bench/run.sh            # skip the middle control run
 #
 # Required env (auto-detected if possible):
@@ -104,7 +105,9 @@ run_one() {
 
 cd "${REPO_ROOT}"
 
-run_one nccl_baseline    ""
+if [[ "${SKIP_NCCL_BASELINE:-0}" != "1" ]]; then
+    run_one nccl_baseline    ""
+fi
 if [[ "${SKIP_NCCL_TORCHCOMMS:-0}" != "1" ]]; then
     run_one nccl_torchcomms  "nccl"
 fi

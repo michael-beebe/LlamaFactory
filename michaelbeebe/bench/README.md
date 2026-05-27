@@ -37,8 +37,9 @@ For each run we collect:
 # Override:
 NPROC=2 STEPS=20 WARMUP=3 ./michaelbeebe/bench/run.sh
 
-# Skip the NCCL-via-TorchComms control run (faster two-way A/B):
-SKIP_NCCL_TORCHCOMMS=1 ./michaelbeebe/bench/run.sh
+# Skip individual runs to focus on a specific pairwise comparison:
+SKIP_NCCL_BASELINE=1 ./michaelbeebe/bench/run.sh    # only nccl_torchcomms vs mscclpp
+SKIP_NCCL_TORCHCOMMS=1 ./michaelbeebe/bench/run.sh  # only nccl_baseline vs mscclpp
 
 # Custom config:
 CONFIG=examples/v1/train_full/train_full_fsdp2.yaml ./michaelbeebe/bench/run.sh

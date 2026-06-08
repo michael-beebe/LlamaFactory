@@ -242,6 +242,79 @@ def plot_loss_curves(run_dir: Path, results: dict, dpi: int):
     plt.close(fig)
 
 
+def plot_nccl_algos(run_dir: Path, results: dict, dpi: int):
+    """Stacked-bar of NCCL algorithm/protocol usage per backend.
+
+    For each run that has NCCL log data (i.e. every run, since we leave
+    NCCL_DEBUG on across the board), show how many dispatched collectives
+    landed in each (Algo/Proto) bucket, faceted by op.
+    """
+    runs = results["runs"]
+    # Gather every (run -> op -> algo_key -> count) datum so we can build a
+    # consistent legend.
+    data = {}  # run_label -> {op: {algo_key: count}}
+    all_ops = set()
+    all_algos = set()
+    for label in RUN_ORDER:
+        if label not in runs:
+            continue
+        algos = runs[label].get("nccl_algos", {})
+        if not algos.get("total_calls"):
+            continue
+        d = {}
+        for op, entries in algos["per_op"].items():
+            d[op] = {f"{e['algo']}/{e['proto']}": e["count"] for e in entries}
+            all_ops.add(op)
+            all_algos.update(d[op].keys())
+        data[label] = d
+    if not data:
+        return
+
+    ops = sorted(all_ops)
+    runs_present = [k for k in RUN_ORDER if k in data]
+    algos = sorted(all_algos)
+
+    # Color per algo/proto: derive a stable color from a categorical map.
+    cmap = plt.get_cmap("tab20")
+    algo_colors = {a: cmap(i % 20) for i, a in enumerate(algos)}
+
+    fig, axes = plt.subplots(
+        1, len(ops),
+        figsize=(max(4 * len(ops), 6), 5),
+        sharey=False,
+        squeeze=False,
+    )
+    axes = axes[0]
+    for ax, op in zip(axes, ops):
+        x = np.arange(len(runs_present))
+        bottoms = np.zeros(len(runs_present))
+        for algo in algos:
+            heights = np.array([data[r].get(op, {}).get(algo, 0) for r in runs_present])
+            if heights.sum() == 0:
+                continue
+            ax.bar(x, heights, bottom=bottoms, label=algo, color=algo_colors[algo], width=0.7)
+            bottoms += heights
+        ax.set_title(op, fontsize=11)
+        ax.set_xticks(x)
+        ax.set_xticklabels([LABELS[r] for r in runs_present], rotation=20, ha="right", fontsize=9)
+        ax.grid(axis="y", alpha=0.3)
+        ax.set_ylabel("Calls" if ax is axes[0] else "")
+
+    # Single legend across all subplots, deduplicated.
+    handles, labels = [], []
+    for ax in axes:
+        for h, l in zip(*ax.get_legend_handles_labels()):
+            if l not in labels:
+                labels.append(l)
+                handles.append(h)
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, -0.02),
+               ncol=min(len(labels), 5), fontsize=9, title="Algo/Proto")
+    fig.suptitle("NCCL algorithm/protocol selection per backend", fontsize=12)
+    fig.tight_layout(rect=(0, 0.06, 1, 0.97))
+    fig.savefig(run_dir / "nccl_algos.png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run-dir", required=True, type=Path)
@@ -260,6 +333,7 @@ def main():
     plot_throughput_bar(args.run_dir, results, args.dpi)
     plot_collectives_breakdown(args.run_dir, results, args.dpi)
     plot_loss_curves(args.run_dir, results, args.dpi)
+    plot_nccl_algos(args.run_dir, results, args.dpi)
     print(f"  wrote PNGs under {args.run_dir} (dpi={args.dpi})")
 
 

@@ -130,14 +130,32 @@ run_one() {
     #                   "nccl"|"mscclpp" → torchcomms with that backend.
     local backend="$2"
     local out_dir="${RUN_DIR}/${label}"
-    mkdir -p "${out_dir}/per_rank"
+    mkdir -p "${out_dir}/per_rank" "${out_dir}/nccl_logs"
 
     echo "== Running: ${label} (backend=${backend:-stock-nccl}) =="
     # Override max_steps from CLI; trace is always on so we can parse algo selection.
+    #
+    # NCCL_DEBUG=INFO + NCCL_DEBUG_SUBSYS=TUNING emits one line per dispatched
+    # collective in the form:
+    #   "NCCL INFO AllReduce: <bytes> Bytes -> Algo RING proto SIMPLE channel..."
+    # plus an INIT-time tuning table. parse.py consumes these to break down which
+    # NCCL algorithm/protocol was selected per op size. NCCL writes to the path
+    # in NCCL_DEBUG_FILE (with %h=host, %p=pid expanded), one file per rank.
+    #
+    # NOTE: we deliberately do NOT include COLL in the subsys list. With 8 ranks
+    # × 30 steps × hundreds of collectives per step, the per-call COLL log line
+    # ("NCCL INFO AllReduce: opCount ... sendbuff ... [nranks=N]") generates
+    # enough log traffic that glog inside _comms_nccl.so OOMs with std::bad_alloc
+    # in LogFileObject::Write. TUNING alone gives us the algo/proto info we
+    # actually need without the volume.
     LLAMAFACTORY_TORCHCOMMS_BACKEND="${backend}" \
     MSCCLPP_TORCHCOMMS_TRACE=1 \
+    NCCL_DEBUG=INFO \
+    NCCL_DEBUG_SUBSYS=TUNING \
+    NCCL_DEBUG_FILE="${out_dir}/nccl_logs/nccl_%h_%p.log" \
     BENCH_TIMING_PATH="${out_dir}/step_timings.jsonl" \
     PYTHONPATH="${BENCH_DIR}/..:${PYTHONPATH:-}" \
+    local rc=0
     torchrun \
         --nproc_per_node="${NPROC}" \
         --rdzv_backend c10d \
@@ -148,9 +166,25 @@ run_one() {
         "${BENCH_DIR}/timing_runner.py" \
         "${CONFIG}" \
         max_steps="${STEPS}" \
-        > "${out_dir}/stdout.log" 2> "${out_dir}/stderr.log" || {
-            echo "  FAILED — see ${out_dir}/stderr.log"; return 1;
-        }
+        > "${out_dir}/stdout.log" 2> "${out_dir}/stderr.log" || rc=$?
+
+    # Distinguish "training failed" from "training succeeded but teardown
+    # crashed". The torchcomms NCCL backend in particular tends to SIGSEGV on
+    # finalize after all training steps have completed; the captured timings
+    # and NCCL logs are still valid for analysis. We treat it as success if
+    # step_timings.jsonl has at least the requested STEPS rows.
+    local timings_count=0
+    if [[ -f "${out_dir}/step_timings.jsonl" ]]; then
+        timings_count=$(wc -l < "${out_dir}/step_timings.jsonl")
+    fi
+    if [[ ${rc} -ne 0 ]] && [[ ${timings_count} -ge ${STEPS} ]]; then
+        echo "  OK (training completed ${timings_count} steps; teardown rc=${rc} — see ${out_dir}/stderr.log)"
+        return 0
+    fi
+    if [[ ${rc} -ne 0 ]]; then
+        echo "  FAILED rc=${rc} (only ${timings_count}/${STEPS} steps recorded) — see ${out_dir}/stderr.log"
+        return 1
+    fi
     echo "  OK"
 }
 
@@ -174,18 +208,7 @@ maybe_run mscclpp          "mscclpp"
 
 if [[ ${#FAILED_RUNS[@]} -gt 0 ]]; then
     echo
-    echo "WARNING: the following runs FAILED (see per-run stderr.log): ${FAILED_RUNS[*]}"
-    for label in "${FAILED_RUNS[@]}"; do
-        if [[ "${label}" == "nccl_torchcomms" ]]; then
-            echo
-            echo "  nccl_torchcomms is known to fail on this system with"
-            echo "  'RuntimeError: bad_weak_ptr' on the very first torchcomms"
-            echo "  all_reduce. This is a bug in the torchcomms NCCL backend"
-            echo "  binary itself, not in LlamaFactory or this bench harness."
-            echo "  See bench/README.md (\"Known limitations\") for the minimal"
-            echo "  repro and workarounds. Use SKIP_NCCL_TORCHCOMMS=1 to skip it."
-        fi
-    done
+    echo "WARNING: the following runs FAILED (training did not complete; see per-run stderr.log): ${FAILED_RUNS[*]}"
 fi
 
 # Parse + plot

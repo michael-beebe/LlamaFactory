@@ -77,6 +77,17 @@ def _build_torchcomms_meshes(backend, current_device, strategy, timeout_sec):
     local_rank = int(_os.environ["LOCAL_RANK"])
     device = _torch.device(current_device.type, local_rank)
 
+    # Keep references to the comms we create so that ``destroy()`` can call
+    # ``comm.finalize()`` on each one explicitly while the Python interpreter
+    # is still healthy. If we let the interpreter shut down with active
+    # torchcomms comms still in scope, the C++ destructor races with the
+    # timeout-watchdog thread firing completion callbacks against
+    # Python-side futures whose underlying objects have already been GC'd,
+    # producing a SIGSEGV inside ``TorchWork::runCallback()`` ~20s after the
+    # last training step. Explicit finalize() flushes pending work and joins
+    # the watchdog cleanly.
+    created_comms: list = []
+
     def _make_1d_mesh(size: int, name: str):
         if size != helper.get_world_size():
             raise NotImplementedError(
@@ -84,6 +95,7 @@ def _build_torchcomms_meshes(backend, current_device, strategy, timeout_sec):
                 f"got size={size} (world={helper.get_world_size()}, name={name})."
             )
         comm = _tc.new_comm(backend, device, name=f"lf_{backend}_{name}")
+        created_comms.append(comm)
         return _tcdm.init_device_mesh(mesh_dim_comms=(comm,), mesh_dim_names=(name,))
 
     world = helper.get_world_size()
@@ -116,7 +128,7 @@ def _build_torchcomms_meshes(backend, current_device, strategy, timeout_sec):
         f"[torchcomms:{backend}] LlamaFactory device meshes initialized: "
         f"model_mesh={model_mesh}, data_mesh={data_mesh}"
     )
-    return model_mesh, data_mesh
+    return model_mesh, data_mesh, created_comms
 
 
 class Dim(StrEnum):
@@ -223,6 +235,10 @@ class DistributedInterface:
             )
             timeout = config.get("timeout", 18000)
 
+        # Track torchcomms communicators we created so destroy() can finalize
+        # them explicitly. Empty when the standard init_process_group path runs.
+        self._torchcomms_comms: list = []
+
         if self._is_distributed:
             # torchcomms hook: when LLAMAFACTORY_TORCHCOMMS_BACKEND is set, route
             # the model/data device meshes through a torchcomms-backed
@@ -236,11 +252,13 @@ class DistributedInterface:
             if not tc_backend and _os.environ.get("LLAMAFACTORY_USE_MSCCLPP", "0") == "1":
                 tc_backend = "mscclpp"
             if tc_backend:
-                self.model_device_mesh, self.data_device_mesh = _build_torchcomms_meshes(
-                    tc_backend,
-                    self.current_device,
-                    self.strategy,
-                    timeout_sec=timeout,
+                self.model_device_mesh, self.data_device_mesh, self._torchcomms_comms = (
+                    _build_torchcomms_meshes(
+                        tc_backend,
+                        self.current_device,
+                        self.strategy,
+                        timeout_sec=timeout,
+                    )
                 )
             else:
                 init_process_group(
@@ -356,8 +374,21 @@ class DistributedInterface:
 
     def destroy(self) -> None:
         """Destroy all processes."""
-        if self._is_distributed:
-            destroy_process_group()
+        if not self._is_distributed:
+            return
+        # Finalize torchcomms communicators BEFORE the rest of teardown so
+        # their timeout-watchdog threads stop cleanly while the Python
+        # interpreter is still healthy. If we let them die during interpreter
+        # shutdown, the watchdog races with future-callback firing on
+        # already-GC'd Python objects, producing a SIGSEGV inside
+        # TorchWork::runCallback() ~tens of seconds after the last step.
+        for comm in self._torchcomms_comms:
+            try:
+                comm.finalize()
+            except Exception as e:  # noqa: BLE001 — best-effort shutdown
+                logger.warning(f"torchcomms comm.finalize() raised on rank {self._rank}: {e!r}")
+        self._torchcomms_comms = []
+        destroy_process_group()
 
 
 if __name__ == "__main__":

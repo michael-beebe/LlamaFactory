@@ -148,6 +148,7 @@ run_one() {
     # enough log traffic that glog inside _comms_nccl.so OOMs with std::bad_alloc
     # in LogFileObject::Write. TUNING alone gives us the algo/proto info we
     # actually need without the volume.
+    local rc=0
     LLAMAFACTORY_TORCHCOMMS_BACKEND="${backend}" \
     MSCCLPP_TORCHCOMMS_TRACE=1 \
     NCCL_DEBUG=INFO \
@@ -155,7 +156,6 @@ run_one() {
     NCCL_DEBUG_FILE="${out_dir}/nccl_logs/nccl_%h_%p.log" \
     BENCH_TIMING_PATH="${out_dir}/step_timings.jsonl" \
     PYTHONPATH="${BENCH_DIR}/..:${PYTHONPATH:-}" \
-    local rc=0
     torchrun \
         --nproc_per_node="${NPROC}" \
         --rdzv_backend c10d \

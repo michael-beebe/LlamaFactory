@@ -128,7 +128,76 @@ def _build_torchcomms_meshes(backend, current_device, strategy, timeout_sec):
         f"[torchcomms:{backend}] LlamaFactory device meshes initialized: "
         f"model_mesh={model_mesh}, data_mesh={data_mesh}"
     )
+
+    # Pre-warm each torchcomms communicator before training starts.
+    #
+    # MSCCL++ native algorithms (and to a lesser extent torchcomms NCCL) defer
+    # heavy one-time initialization to the FIRST execute() call. For MSCCL++
+    # specifically, ``NativeAlgorithm::execute()`` (src/core/algorithm.cc:47)
+    # lazily calls ``initFunc_(comm)`` on the first dispatch, which sets up
+    # SM-channel CUDA-IPC handshakes across all GPU pairs (~13s on 8 H100s).
+    # Without this warmup the cost lands on training step 1, distorting both
+    # the median step time and the loss-vs-time view. Triggering a tiny
+    # all_gather + all_reduce + reduce_scatter on each mesh here amortizes
+    # the per-algorithm InitFunc cost into the bench setup phase.
+    if _os.environ.get("LLAMAFACTORY_TORCHCOMMS_WARMUP", "1") == "1":
+        _warmup_torchcomms_meshes((model_mesh, data_mesh), device, backend)
+
     return model_mesh, data_mesh, created_comms
+
+
+def _warmup_torchcomms_meshes(meshes, device, backend: str) -> None:
+    """Fire a few collectives on each mesh to trigger lazy per-algorithm init.
+
+    Calls (small) all_gather / all_reduce / reduce_scatter on each provided
+    DeviceMesh's underlying ProcessGroup. The actual data exchanged is
+    irrelevant — we only care about the side effect of triggering each
+    backend's lazy InitFunc / context registration before the StepTiming
+    callback starts ticking on training step 1.
+
+    Errors are logged but not raised: warmup is best-effort. If a particular
+    backend hasn't registered an algorithm for one of these ops (e.g. MSCCL++
+    falling back to NCCL for reduce_scatter), the call still flows through
+    and warms up whatever code path will be used.
+    """
+    import torch as _torch
+    import torch.distributed as _dist
+
+    world = helper.get_world_size()
+    # Tiny payloads keep the warmup itself fast (<100ms) — the cost we're
+    # trying to amortize is the per-algorithm InitFunc, which fires
+    # regardless of message size.
+    small = _torch.zeros(64, dtype=_torch.float32, device=device)
+    gathered = _torch.zeros(64 * world, dtype=_torch.float32, device=device)
+    scattered = _torch.zeros(64 // world if world > 1 else 64, dtype=_torch.float32, device=device)
+    gather_input = _torch.zeros(64, dtype=_torch.float32, device=device)
+    rs_input = _torch.zeros(64, dtype=_torch.float32, device=device)
+
+    seen_pgs = set()
+    for mesh in meshes:
+        if mesh is None:
+            continue
+        try:
+            pg = mesh.get_group()
+        except Exception:
+            continue
+        if id(pg) in seen_pgs:
+            continue
+        seen_pgs.add(id(pg))
+        for op_name, op_call in (
+            ("all_reduce", lambda: _dist.all_reduce(small, group=pg)),
+            ("all_gather_into_tensor", lambda: _dist.all_gather_into_tensor(gathered, gather_input, group=pg)),
+            ("reduce_scatter_tensor", lambda: _dist.reduce_scatter_tensor(scattered, rs_input, group=pg)),
+        ):
+            try:
+                op_call()
+            except Exception as e:  # noqa: BLE001 — best-effort warmup
+                logger.warning(
+                    f"[torchcomms:{backend}] warmup {op_name} on mesh {mesh.mesh_dim_names} "
+                    f"failed (non-fatal): {e!r}"
+                )
+    _torch.cuda.synchronize(device)
+    logger.info_rank0(f"[torchcomms:{backend}] warmup collectives complete")
 
 
 class Dim(StrEnum):

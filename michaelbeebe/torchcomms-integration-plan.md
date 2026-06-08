@@ -1,9 +1,15 @@
 # MSCCL++ TorchComms Integration — Recommended Improvements
 
-This document captures findings from the LlamaFactory FSDP2 benchmark
-(NCCL vs NCCL/TorchComms vs MSCCL++/TorchComms) and proposes concrete
-changes to close the perf gap. Every claim cites file:line so it can be
-verified independently.
+**Scope:** changes confined to the torchcomms integration. That means
+**only** these files are in scope:
+
+* `python/mscclpp_torchcomms/csrc/` (the C++ backend)
+* `python/mscclpp_torchcomms/CMakeLists.txt`
+* `LlamaFactory/src/llamafactory/v1/accelerator/interface.py` (the consumer hook)
+
+Everything under `src/core/`, `src/ext/collectives/`, and
+`src/ext/nccl/` is explicitly **out of scope** — those are MSCCL++
+library / NCCL-shim concerns, not torchcomms integration concerns.
 
 ## Bench baseline (8× H100, FSDP2, Qwen3-4B, 30 steps)
 
@@ -13,270 +19,218 @@ verified independently.
 | NCCL via TorchComms    | 247 ms      | 2.5 s    | same NCCL `RING/SIMPLE` |
 | MSCCL++ via TorchComms | 295 ms (**+19%**) | **15.85 s** | allgather: `fullmesh2` (97%) + `fullmesh` (3%); allreduce (tiny only): `allpair_packet`; reduce_scatter: **fallback → NCCL** |
 
-The MSCCL++ slowdown decomposes into two distinct problems:
+## Root cause analysis
 
-1. **Step-1 spike** (~13 s extra vs NCCL on the first iteration) — the
-   integration's lazy-init story. Already mostly addressed by the
-   LlamaFactory-side warmup in
-   [`src/llamafactory/v1/accelerator/interface.py`](../src/llamafactory/v1/accelerator/interface.py)
-   (commit `7b606ee1`).
-2. **Steady-state +19% slowdown** (every step after warmup) — driven by
-   the integration hard-coding `symmetricMemory=false` and the selector
-   picking the cache-hostile `fullmesh2` algorithm anyway. **This is the
-   real problem.**
+### A. Step-1 latency (15.85 s vs 2.5 s)
 
-## Root cause analysis (with evidence)
-
-### A. Step-1 latency
-
-`NativeAlgorithm::execute()` defers per-algorithm initialization to the
-first call:
-
-```cpp
-// src/core/algorithm.cc:47
-if (!initialized_) {
-    initFunc_(comm);          // CUDA IPC handshakes for all GPU pairs
-    initialized_ = true;
-}
-```
-
-The `TorchCommMSCCLPP` backend constructs the `AlgorithmCollection` in
-`init()` but never calls `execute()` on any of the registered
-algorithms, so the first user collective during training pays the
-full `InitFunc` cost (~13 s on 8 H100s for the three algorithms FSDP2
-exercises: `fullmesh`, `fullmesh2`, `allpair_packet`).
-
-NCCL avoids this because its equivalent setup happens during
-`init_process_group` — *before* the StepTimingCallback starts ticking.
+`NativeAlgorithm::execute()` (in the library) defers `InitFunc` to the
+first call. Our `TorchCommMSCCLPP::init()` builds the algorithm
+collection but never warms it — so the user's first training collective
+pays the cost. Already mitigated app-side in LlamaFactory (commit
+`7b606ee1`); we should pull this into our backend (see R5 below).
 
 ### B. Steady-state +19% slowdown
 
-Two compounding problems:
+Decomposes into two parts:
 
-**B1.** `AllgatherFullmesh2::generateAllgatherContextKey` returns a
-unique key on every call when symmetric memory is off:
+**B1. `fullmesh2` keeps re-registering memory.** `fullmesh2`'s context
+key generator returns `tag++` whenever `symmetricMemory == false`. We
+set `symmetricMemory = false` in `TorchCommMSCCLPP.cpp:117`, AND the
+NCCL-shim selector our `selectAlgorithm()` delegates to picks `fullmesh2`
+for every allgather ≤32 MiB. Net effect: every allgather (1989 calls/run)
+re-registers GPU memory across all peers via `TcpBootstrap`. That's the
+bulk of the +19%.
 
-```cpp
-// src/ext/collectives/allgather/allgather_fullmesh_2.cu:195-200
-static int tag = 0;
-symmetricMemory_ = symmetricMemory;
-if (!symmetricMemory_) {
-    // always return a new key if symmetric memory is not enabled.
-    return mscclpp::AlgorithmCtxKey{nullptr, nullptr, 0, 0, tag++};
-}
-```
+**B2. Per-call wrapper overhead.** ~5-15 μs per dispatch from
+`std::getenv("MSCCLPP_TORCHCOMMS_TRACE")` (every call!),
+`selectAlgorithm()` doing map lookups + selector evaluation with no
+caching, heap-alloc'ing a fresh `TorchWorkMSCCLPP` per call, and two
+`cudaEventRecord`s. Aggregate is ~10-30 ms across 2100 calls (≈0.3-1%
+of cumulative step time). Smaller contributor than B1 but free to fix.
 
-That means the context cache misses on *every* dispatch, triggering a
-full `ContextInitFunc` which re-registers GPU memory across **all** peers
-via `comm->registerMemory()` + `setupRemoteMemories()` (an exchange over
-`TcpBootstrap`).
+### C. reduce_scatter falls back to NCCL
 
-**B2.** Our backend hard-codes `symmetricMemory=false`:
-
-```cpp
-// python/mscclpp_torchcomms/csrc/TorchCommMSCCLPP.cpp:117
-mscclpp::nccl::AlgorithmSelectorConfig config{
-    .symmetricMemory = false,
-    ...
-};
-```
-
-So we always hit the slow path. And the selector picks `fullmesh2` for
-*every* allgather ≤32 MiB regardless:
-
-```cpp
-// src/ext/nccl/algorithm_selector.cc:153-156
-if (messageSize <= 32 * (1 << 20)) {
-    return algoMap.at("default_allgather_fullmesh2");
-}
-```
-
-Sister algorithm `default_allgather_fullmesh` would behave well —
-`AlgorithmCtxKey{nullptr, nullptr, 0, 0, 0}` (always the same key
-→ cache always hits) — but is only picked for >32 MiB messages.
-
-FSDP2 with CUDA graphs would *not* fix this — `tag++` ignores buffer
-pointers entirely. The selector picking `fullmesh2` for sub-32 MiB
-allgathers is the issue, full stop.
-
-### C. `reduce_scatter` falls back to NCCL
-
-No native MSCCL++ `reduce_scatter` algorithm is registered. FSDP2's
-main gradient-reduction op (290 calls / 30 steps) goes through the
-dlopen'd `libnccl.so.2`. We pay **NCCL cost + a fallback dispatch
-layer** for every gradient reduction.
+**Out of scope** per request — requires a new MSCCL++ kernel.
 
 ## Recommendations (in priority order)
 
 ### P0 — Steady-state perf (closes most of the +19% gap)
 
-#### R1 — Make the selector prefer `fullmesh` over `fullmesh2` when symmetric memory isn't available
+#### R0 — Replace the fullmesh2 preference in our selector
 
-| Field | Value |
-|---|---|
-| Where | mscclpp repo — `src/ext/nccl/algorithm_selector.cc:148-167` |
-| Effort | ~30 min |
-| Estimated impact | -10 to -15% step time (eliminates the per-call IPC re-registration) |
-| Risk | Low. `fullmesh` is the existing default for >32 MiB; we'd just extend its range when no symmetric memory. |
+**Where:** `python/mscclpp_torchcomms/csrc/TorchCommMSCCLPP.cpp::selectAlgorithm()` (line 93-141)
 
-Proposed change:
+**Effort:** ~2 hours
+**Estimated impact:** **-10 to -15% step time** (this is the single biggest in-scope win)
+**Risk:** Low — `fullmesh` is well-tested and already used as the fallback for >32 MiB allgathers.
+
+`selectAlgorithm()` currently delegates allgather selection to
+`mscclpp::nccl::selectSingleNodeAllgather(algoMap, request, config)`,
+which picks `default_allgather_fullmesh2` for every allgather ≤32 MiB.
+We do this delegation ourselves — we can intercept it.
+
+Proposed change inside `selectAlgorithm()` around line 138:
 
 ```cpp
-std::shared_ptr<Algorithm> selectSingleNodeAllgather(
-    const std::unordered_map<std::string, std::shared_ptr<Algorithm>>& algoMap,
-    const CollectiveRequest& request,
-    const AlgorithmSelectorConfig& config) {
-  const size_t messageSize = request.messageSize;
-
-  if (messageSize <= 32 * (1 << 20)) {
-    // fullmesh2 caches per buffer config ONLY when symmetric memory is
-    // available. Without it, every call re-registers memory across all
-    // peers — far slower than NCCL Ring for typical FSDP2 sizes. Prefer
-    // fullmesh in that case, which has a constant context key and reuses
-    // its registration across calls.
-    if (!config.symmetricMemory && !config.isCuMemMapAllocated) {
-      return algoMap.at("default_allgather_fullmesh");
+if (request.collective == "allgather") {
+    // fullmesh2 caches per-buffer-config ONLY when symmetric memory is
+    // available. Without it, every call re-registers IPC memory across
+    // all peers (~ms-scale TcpBootstrap exchange), which dominates step
+    // time on FSDP2-style workloads. Prefer fullmesh in that case, which
+    // always reuses the same context.
+    const size_t messageSize = request.messageSize;
+    if (!config.symmetricMemory && !config.isCuMemMapAllocated && messageSize <= 32 * (1 << 20)) {
+        auto it = algoMap.find("default_allgather_fullmesh");
+        if (it != algoMap.end()) return it->second;
     }
-    return algoMap.at("default_allgather_fullmesh2");
-  }
-  // ... existing >32 MiB handling unchanged
+    return mscclpp::nccl::selectSingleNodeAllgather(algoMap, request, config);
 }
 ```
 
-#### R2 — Register a native MSCCL++ `reduce_scatter` algorithm
+We do **not** modify the upstream `selectSingleNodeAllgather`; we just
+short-circuit it in our delegating function.
 
-| Field | Value |
-|---|---|
-| Where | mscclpp repo — new files under `src/ext/collectives/reduce_scatter/`, registration in `src/ext/collectives/algorithm_collection_builder.cc` |
-| Effort | ~1-2 weeks (new CUDA kernel) |
-| Estimated impact | -5 to -10% (eliminates NCCL fallback dispatch + uses NVLink directly) |
-| Risk | Medium — new kernel implementation, need correctness tests |
+#### R1 — Detect and propagate real `symmetricMemory` flag
 
-Pattern can mirror `AllgatherFullmesh` in reverse: each peer writes a
-partial-reduced chunk to a per-destination scratch buffer via
-`SmChannel`, a single kernel performs the final reduction into the
-output. This is what NCCL does internally for Ring ReduceScatter; the
-gain comes from skipping the libnccl.so dlopen marshalling layer and
-using the cached connection state we already paid for in `InitFunc`.
+**Where:** `python/mscclpp_torchcomms/csrc/TorchCommMSCCLPP.cpp:117`
 
-### P1 — Step-1 latency (cleanup of the workaround)
+**Effort:** ~1 day
+**Estimated impact:** Future-proof. Today it changes nothing because
+FSDP2 doesn't use SymmetricMemory yet. When upstream PyTorch enables it
+for FSDP2 (work in progress in `torch._distributed._symmetric_memory`),
+this flips on automatically and `fullmesh2` becomes cache-friendly.
+**Risk:** Low — `false` default keeps current behavior correct.
 
-#### R3 — Move the warmup into `TorchCommMSCCLPP::init()` (library-level, not app-level)
+Replace the hard-coded `.symmetricMemory = false` with a detection
+helper: check whether the input/output tensor storage is backed by
+`SymmetricMemory` (using PyTorch's `at::cuda::SymmetricMemory::has_memory(t)`
+or equivalent storage-pointer check). Plumb through to the selector.
 
-| Field | Value |
-|---|---|
-| Where | mscclpp repo — `python/mscclpp_torchcomms/csrc/TorchCommMSCCLPP.cpp::init()` (end of method) |
-| Effort | ~1 hour |
-| Estimated impact | Step 1 drops from ~16 s to ~3 s for every consumer, not just LlamaFactory |
-| Risk | Low — `AlgorithmCollection` already exists by the end of init; we iterate it and run one dummy execute per algo |
+### P1 — Per-call wrapper overhead (small but free)
 
-The LlamaFactory-side warmup
-([`_warmup_torchcomms_meshes`](../src/llamafactory/v1/accelerator/interface.py))
-is a workaround for what should be backend behavior. Move it down a
-layer so torchtitan, vLLM, and any future torchcomms consumer get the
-same fix for free.
+#### R2 — Cache the trace flag at init time
 
-Sketch:
+**Where:** `python/mscclpp_torchcomms/csrc/TorchCommMSCCLPP.{hpp,cpp}`
+
+**Effort:** ~30 min
+**Estimated impact:** Removes the `std::getenv` call from every dispatch.
+~50-200 ns × 2100 calls ≈ 0.1-0.4 ms/run. Tiny but trivially free.
+**Risk:** None — semantics unchanged, just cached.
+
+In `init()`, read `MSCCLPP_TORCHCOMMS_TRACE` once and stash on a
+`const bool trace_;` member. Replace the two `std::getenv` sites in
+`executeCollective()` and `reduce_scatter_single` with `if (trace_)`.
+
+#### R3 — Cache the (collective, message-size-bucket) → algorithm lookup
+
+**Where:** `python/mscclpp_torchcomms/csrc/TorchCommMSCCLPP.{hpp,cpp}::selectAlgorithm()`
+
+**Effort:** ~2 hours
+**Estimated impact:** Removes ~1-5 μs/call from the selector walk. Modest
+direct savings, but more importantly it lets us add other selector
+heuristics in R0 without worrying about per-call cost.
+**Risk:** Low — cache key (collective, log2(messageSize)) plus a few
+config bits captures every meaningful selection input. Cache is rebuilt
+on `init()`/`finalize()` boundaries.
+
+Add a tiny per-comm cache:
 ```cpp
-void TorchCommMSCCLPP::init(...) {
-  // ... existing init building algorithmCollection_ ...
-
-  // Trigger lazy InitFunc on every registered native algorithm so the
-  // first user collective doesn't pay the CUDA-IPC handshake cost.
-  for (const auto& [collective, byName] : algorithmCollection_->algorithms()) {
-    for (const auto& [algoName, algo] : byName) {
-      if (algo->type() != AlgorithmType::Native) continue;
-      // tiny stream-allocated dummy buffers; ignore output, only the
-      // first-dispatch side effect matters.
-      runOneWarmupCollective(algo, internal_stream_);
-    }
-  }
-  cudaStreamSynchronize(internal_stream_);
-}
+struct AlgoSelectionKey {
+    std::string collective;
+    int sizeBucket;     // = log2(messageSize), -1 for 0-byte
+    bool symMem;
+    bool cuMemMap;
+};
+std::unordered_map<AlgoSelectionKey, std::shared_ptr<mscclpp::Algorithm>> selectionCache_;
 ```
 
-#### R4 — Remove the LlamaFactory-side warmup once R3 lands
+Look up first; on miss, run the full selector and cache the answer.
 
-| Field | Value |
-|---|---|
-| Where | `src/llamafactory/v1/accelerator/interface.py::_warmup_torchcomms_meshes` |
-| Effort | 5 min |
-| Estimated impact | None on perf (R3 already covers it); just code hygiene |
+#### R4 — Pool TorchWorkMSCCLPP objects
 
-### P2 — Observability + future-proofing
+**Where:** `python/mscclpp_torchcomms/csrc/TorchWorkMSCCLPP.{hpp,cpp}`
 
-#### R5 — Per-call wall-time instrumentation
+**Effort:** ~half day
+**Estimated impact:** Removes the ~1 μs heap allocation per call. ~2 ms
+across 2100 calls. **Probably not worth doing** unless we find that
+allocator contention shows up under heavier workloads.
+**Risk:** Medium — `c10::intrusive_ptr` lifetime is tricky to pool
+correctly. Defer unless R6 instrumentation proves it matters.
 
-| Field | Value |
-|---|---|
-| Where | `python/mscclpp_torchcomms/csrc/TorchWorkMSCCLPP.cpp` |
-| Effort | ~1 day |
-| Estimated impact | Diagnostic only — lets us decompose step time into "registration / kernel / fallback dispatch / collective wait" |
-| Risk | Low; gated behind `MSCCLPP_TORCHCOMMS_TRACE=2` so it's off by default |
+### P2 — Step-1 latency cleanup
 
-Currently `MSCCLPP_TORCHCOMMS_TRACE=1` emits one line per dispatch with
-algo + bytes + dtype but no timing. Adding wall-time fields would let us
-see *exactly* which phase dominates the per-call overhead (we suspect
-`registerMemory` from R1, but it would be nice to confirm). Useful for
-finding the next bottleneck after R1+R2 land.
+#### R5 — Move the LlamaFactory-side warmup into `TorchCommMSCCLPP::init()`
 
-#### R6 — Plumb `symmetricMemory` from the tensor's storage
+**Where:** `python/mscclpp_torchcomms/csrc/TorchCommMSCCLPP.cpp::init()`,
+then delete `_warmup_torchcomms_meshes` in `interface.py`.
 
-| Field | Value |
-|---|---|
-| Where | `python/mscclpp_torchcomms/csrc/TorchCommMSCCLPP.cpp:117` |
-| Effort | ~1 day |
-| Estimated impact | Future-proof: when PyTorch SymmetricMemory + FSDP2 integration lands upstream, our backend will automatically benefit (cache hits, faster `fullmesh2`) |
-| Risk | Low; default-false fallback stays correct |
+**Effort:** ~1 hour
+**Estimated impact:** No additional perf gain over today's app-side
+warmup, but the fix benefits every torchcomms consumer (torchtitan,
+future apps) and lets us drop the workaround from LlamaFactory.
+**Risk:** Low — the app-side version stays as a fallback until R5 lands.
 
-Replace the hard-coded `.symmetricMemory = false` with a runtime check:
-inspect the tensor's storage allocator (or check
-`at::cuda::SymmetricMemory::has_memory(tensor)`) and pass the real
-value through to the selector.
+At the end of `init()`, iterate the registered native algorithms and run
+each one once with tiny dummy buffers on `internal_stream_`. This
+triggers the lazy `InitFunc` (per-algorithm CUDA-IPC handshake) **before**
+the user's first training collective.
 
-## Out of scope
+### P3 — Observability
 
-- **CUDA graphs**: FSDP2 doesn't use them today. Even if it did,
-  `fullmesh2`'s `tag++` would still miss the cache regardless of buffer
-  stability. R1 above is the correct fix; CUDA graphs are orthogonal.
-- **Multi-node selection**: the existing selector only handles
-  single-node NVLink. Adding IB-aware multi-node selection is future
-  work and unrelated to the current FSDP2-on-one-node bottleneck.
-- **NVLS** (NVLink Switch): not configured / not available on this
-  hardware. Algorithm registry includes NVLS variants but the selector
-  skips them when `nvlsSupported=false`.
+#### R6 — Per-call wall-time instrumentation (`MSCCLPP_TORCHCOMMS_TRACE=2`)
+
+**Where:** `python/mscclpp_torchcomms/csrc/TorchCommMSCCLPP.cpp`, `TorchWorkMSCCLPP.cpp`
+
+**Effort:** ~1 day
+**Estimated impact:** Diagnostic only. Lets us decompose each
+collective's wall time into: selector time, context init time, kernel
+launch time, fallback dispatch time. Useful for finding the next
+bottleneck after R0 lands.
+**Risk:** None — gated behind `TRACE=2`, off by default.
+
+## What was deferred or dropped
+
+| Original idea | Status | Why |
+|---|---|---|
+| Tweak `src/ext/nccl/algorithm_selector.cc` to prefer `fullmesh` | **Replaced by R0** | Out of scope (library code); R0 achieves the same effect from inside our integration |
+| Add a native MSCCL++ `reduce_scatter` algorithm | **Dropped per request** | Requires new CUDA kernel; out of torchcomms integration scope |
+| Pool TorchWorkMSCCLPP objects (R4) | **Deferred** | Smallest expected impact; revisit only if profiling shows allocator pressure |
+| CUDA-graph capture support | **Out of scope** | FSDP2 doesn't use CUDA graphs; would require upstream PyTorch FSDP2 changes |
 
 ## Verification plan
 
 | Recommendation | How to verify | Pass criteria |
 |---|---|---|
-| R1 | Run bench; check `[MSCCLPP] rank=0 collective=allgather` trace lines | All ≤32 MiB allgathers show `algo='default_allgather_fullmesh'`. Median step time drops from ~295 ms toward ~255 ms (parity with NCCL/TorchComms). |
-| R2 | Same bench, check `[NcclFallback]` trace lines | Zero `reduce_scatter -> NCCL` fallbacks. Median step time drops another 5-10%. |
-| R3 | Disable R4 + set `LLAMAFACTORY_TORCHCOMMS_WARMUP=0` | First step ≤4 s (was 15.85 s with no warmup). |
-| R5 | Set `MSCCLPP_TORCHCOMMS_TRACE=2`; run one training step | Per-call trace lines sum to ≥95% of the step's wall time; allows attribution. |
-| R6 | Run with PyTorch SymmetricMemory enabled (when upstream lands) | Trace shows `symmetricMemory=true` and `fullmesh2` cache hits (no `tag++` churn). |
+| R0 | `MSCCLPP_TORCHCOMMS_TRACE=1`; grep for `algo='default_allgather_*'` lines | All ≤32 MiB allgathers report `algo='default_allgather_fullmesh'`. Median step time drops from ~295 ms toward ~250 ms (parity with NCCL/TorchComms). |
+| R1 | Run with PyTorch SymmetricMemory enabled once available | Trace shows `symmetricMemory=true`; `fullmesh2` cache hits visible in any added context-init counter. |
+| R2 | `strace -e trace=getenv` on rank 0 during one step | Zero `getenv("MSCCLPP_TORCHCOMMS_TRACE")` calls after `init()` returns. |
+| R3 | Add a hit/miss counter to the selection cache; print on `finalize()` | After warmup, miss count == small constant (≤ number of distinct collective-bucket pairs); hit count == total dispatches − miss count. |
+| R5 | Set `LLAMAFACTORY_TORCHCOMMS_WARMUP=0`; rebuild backend with R5 | Step 1 ≤ 4 s (was 15.85 s without warmup, ~0.5 s with app-side warmup). |
+| R6 | `TRACE=2`; sum per-call durations from one step | Sum ≥ 95% of step's wall-clock time; allows attribution. |
 
-## Estimated overall outcome
+## Expected outcome
 
-After R1 + R2 + R3:
+After R0 + (R2, R3, R5):
 
-| Backend | median step (today) | median step (projected) |
-|---|---|---|
-| stock NCCL | 256 ms | 256 ms (baseline) |
-| NCCL via TorchComms | 247 ms | 247 ms (baseline) |
-| MSCCL++ via TorchComms | **295 ms (+19%)** | **~240 ms (-3%)** |
+| Backend                | today               | projected           |
+|------------------------|---------------------|---------------------|
+| stock NCCL             | 256 ms              | 256 ms (baseline)   |
+| NCCL via TorchComms    | 247 ms              | 247 ms (baseline)   |
+| MSCCL++ via TorchComms | **295 ms (+19%)**   | **~250 ms (±2%)**   |
 
-I.e. MSCCL++ should reach parity or modestly beat NCCL on this 8×H100
-FSDP2 workload. To go faster than that on this hardware we'd need NVLS,
-which isn't available here.
+I.e., MSCCL++ should reach **parity** with NCCL/TorchComms on this
+workload using only torchcomms-integration changes. To go faster on
+this exact workload we'd need either (a) a native `reduce_scatter`
+algorithm (out of scope per request), (b) PyTorch SymmetricMemory
++ FSDP2 (R1 future-proofs for it), or (c) NVLS support (different
+hardware).
 
 ## Owner-side actions
 
-1. Review this document, push back on anything that doesn't match your
-   priorities.
-2. Decide whether R2 (new kernel) is in scope or should wait — it's the
-   biggest single-item effort but also has the second-biggest payoff.
-3. Decide whether the mscclpp changes (R1, R2, R3, R5, R6) land on
-   `michaelbeebe/torchcomms` (your fork branch) or go upstream as a PR
-   to microsoft/mscclpp. R1 alone is a self-contained 10-line patch
-   that would be uncontroversial to upstream.
+1. Review priorities — flag anything you want re-ordered or dropped.
+2. Confirm R0 is the right first move (highest ROI, smallest change, in scope).
+3. Decide whether R5 lands now or later. The current app-side warmup
+   works; R5 is mainly a "do it in the right place" cleanup.
+4. All R# changes go on `michaelbeebe/torchcomms-llamafactory-testing`
+   (the work branch we made earlier), **not** `michaelbeebe/torchcomms`
+   (the PR branch).

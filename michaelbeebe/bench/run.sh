@@ -150,7 +150,7 @@ run_one() {
     # actually need without the volume.
     local rc=0
     LLAMAFACTORY_TORCHCOMMS_BACKEND="${backend}" \
-    MSCCLPP_TORCHCOMMS_TRACE=1 \
+    MSCCLPP_TORCHCOMMS_TRACE="${MSCCLPP_TORCHCOMMS_TRACE:-1}" \
     NCCL_DEBUG=INFO \
     NCCL_DEBUG_SUBSYS=TUNING \
     NCCL_DEBUG_FILE="${out_dir}/nccl_logs/nccl_%h_%p.log" \

@@ -158,64 +158,141 @@ def plot_throughput_bar(run_dir: Path, results: dict, dpi: int):
 
 
 def plot_collectives_breakdown(run_dir: Path, results: dict, dpi: int):
-    """Stacked-bar: count of collective ops on rank 0 by category, per run."""
+    """Stacked-bar: per-rank-0 collective dispatch counts, broken out by
+    (collective, algorithm) bucket, for every backend in the run.
+
+    Three data sources feed this plot:
+
+      1. ``collectives.summary.by_algo`` — MSCCL++ native algorithms
+         (e.g. ``default_allgather_fullmesh``), extracted from the
+         ``[MSCCLPP]`` trace lines our backend emits at TRACE>=1. Only
+         the mscclpp run produces these.
+      2. ``collectives.summary.by_fallback_op`` — calls that went through
+         our NcclFallback dispatcher (e.g. ``reduce_scatter``). Only the
+         mscclpp run produces these.
+      3. ``nccl_algos.per_op`` — NCCL ring/tree algorithm + protocol
+         choices captured from NCCL_DEBUG=INFO logs. Every backend that
+         used libnccl produces this (nccl_baseline, nccl_torchcomms, and
+         mscclpp's fallback path).
+
+    Previously this plot only consumed #1+#2, so the NCCL bars showed
+    as zero (no MSCCL++ trace lines emitted) even though those backends
+    were doing 18000+ collectives. Now all three sources are merged,
+    op names are normalized (e.g. ``AllGather`` <-> ``allgather``), and
+    each (op, algo) bucket gets one stack segment so the bars are
+    directly comparable across backends.
+    """
     runs = results["runs"]
     if not runs:
         return
-    # Aggregate categories: native algos (named) + fallback ops (named).
-    all_categories = set()
-    per_run_counts = {}
+
+    def _normalize_op(name: str) -> str:
+        """Make NCCL CamelCase and MSCCL++ lowercase op names line up."""
+        return name.lower().replace("_", "")
+
+    # Per-run map of (op, algo_label) -> count, with op names normalized so
+    # mscclpp's 'allgather' lines up with NCCL's 'AllGather'.
+    per_run_counts: dict[str, dict[tuple[str, str], int]] = {}
+    all_buckets: set[tuple[str, str]] = set()
+
     for k in RUN_ORDER:
         if k not in runs:
             continue
-        s = runs[k]["collectives"]["summary"]
-        d = {}
-        for algo_key, vals in s["by_algo"].items():
-            # algo_key: "collective|algo_name|TYPE"
-            parts = algo_key.split("|")
-            label = f"{parts[0]} ({parts[1]})"
-            d[label] = d.get(label, 0) + vals["count"]
-        for op, vals in s["by_fallback_op"].items():
-            label = f"{op} (NCCL fallback)"
-            d[label] = d.get(label, 0) + vals["count"]
-        per_run_counts[k] = d
-        all_categories.update(d.keys())
+        d: dict[tuple[str, str], int] = {}
+        cs = runs[k]["collectives"]["summary"]
+
+        # Source 1: MSCCL++ native algorithm dispatches.
+        for algo_key, vals in cs.get("by_algo", {}).items():
+            # algo_key format: "collective|algo_name|TYPE"
+            op_raw, algo_name, _atype = algo_key.split("|")
+            label = f"{_normalize_op(op_raw)} · MSCCL++ {algo_name.replace('default_', '')}"
+            d[(_normalize_op(op_raw), label)] = d.get((_normalize_op(op_raw), label), 0) + vals["count"]
+
+        # Source 2: MSCCL++ -> NCCL fallback dispatches (op-level only,
+        # algo/proto comes from source 3 below).
+        for op_raw, vals in cs.get("by_fallback_op", {}).items():
+            label = f"{_normalize_op(op_raw)} · NCCL fallback"
+            d[(_normalize_op(op_raw), label)] = d.get((_normalize_op(op_raw), label), 0) + vals["count"]
+
+        # Source 3: NCCL algorithm+protocol choices (any backend that used
+        # libnccl, including mscclpp's fallback path).
+        #
+        # IMPORTANT: NCCL only populates one of the NCCL_DEBUG_FILE files
+        # in practice — the rank that the global NCCL state is owned by —
+        # so the per-op counts in nccl_algos.per_op are already rank-0-only,
+        # NOT all-ranks-aggregated. (Verified: 1 of 8 per-rank NCCL log
+        # files contains real data, the other 7 only carry the version
+        # banner.) So we use the counts as-is, no normalization.
+        #
+        # For nccl_baseline / nccl_torchcomms this is the only source.
+        # For mscclpp these calls were ALREADY counted as fallbacks in
+        # source 2 above (the [NcclFallback] trace lines our backend
+        # emits), so we'd be double-counting them. Skip those ops for the
+        # mscclpp backend to avoid the duplicate.
+        nccl_algos = runs[k].get("nccl_algos", {})
+        mscclpp_fallback_ops = {_normalize_op(o) for o in cs.get("by_fallback_op", {})}
+        for op_raw, entries in nccl_algos.get("per_op", {}).items():
+            op = _normalize_op(op_raw)
+            if k == "mscclpp" and op in mscclpp_fallback_ops:
+                continue  # already counted by source 2 above
+            for entry in entries:
+                label = f"{op} · NCCL {entry['algo']}/{entry['proto']}"
+                d[(op, label)] = d.get((op, label), 0) + entry["count"]
+
+        if d:
+            per_run_counts[k] = d
+            all_buckets.update(d.keys())
 
     if not per_run_counts:
         return
 
-    cats = sorted(all_categories)
+    # Sort buckets by (normalized op, label) so legend groups by operation.
+    buckets = sorted(all_buckets)
     runs_present = [k for k in RUN_ORDER if k in per_run_counts]
     x = np.arange(len(runs_present))
-    width = 0.7
+    width = 0.6
 
-    # Color: blue shades for MSCCL++ native, orange for fallback.
-    colors = []
-    for c in cats:
-        if "fallback" in c.lower():
-            colors.append("#D83B01")
-        elif "fullmesh2" in c.lower():
-            colors.append("#0078D4")
-        elif "fullmesh" in c.lower():
-            colors.append("#106EBE")
-        elif "packet" in c.lower():
-            colors.append("#005A9E")
-        else:
-            colors.append("#666666")
+    # Color scheme:
+    #   - allgather   : blue family
+    #   - allreduce   : green family
+    #   - reducescatter: orange family
+    #   - other       : gray
+    # Within each family, MSCCL++ native = darker shade, NCCL = lighter,
+    # NCCL fallback = warmest accent.
+    family_palettes = {
+        "allgather":      ("#0D47A1", "#1976D2", "#42A5F5", "#90CAF9"),
+        "allreduce":      ("#1B5E20", "#388E3C", "#66BB6A", "#A5D6A7"),
+        "reducescatter":  ("#E65100", "#F57C00", "#FB8C00", "#FFB74D"),
+    }
+    fallback_color = "#D83B01"
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    bucket_colors: list[str] = []
+    family_seen: dict[str, int] = {}
+    for op, label in buckets:
+        if "fallback" in label.lower():
+            bucket_colors.append(fallback_color)
+            continue
+        palette = family_palettes.get(op, ("#666666", "#888888", "#AAAAAA", "#CCCCCC"))
+        idx = family_seen.get(op, 0)
+        bucket_colors.append(palette[min(idx, len(palette) - 1)])
+        family_seen[op] = idx + 1
+
+    fig, ax = plt.subplots(figsize=(10, 6))
     bottoms = np.zeros(len(runs_present))
-    for cat, color in zip(cats, colors):
-        heights = np.array([per_run_counts[r].get(cat, 0) for r in runs_present])
-        ax.bar(x, heights, width=width, bottom=bottoms, label=cat, color=color)
+    for (op, label), color in zip(buckets, bucket_colors):
+        heights = np.array([per_run_counts[r].get((op, label), 0) for r in runs_present])
+        if heights.sum() == 0:
+            continue
+        ax.bar(x, heights, width=width, bottom=bottoms, label=label, color=color, edgecolor="white", linewidth=0.3)
         bottoms += heights
 
     ax.set_xticks(x)
     ax.set_xticklabels([LABELS[r] for r in runs_present])
     ax.set_ylabel("Collective op count (rank 0)")
     ax.set_title("Collective dispatch breakdown by algorithm")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0), fontsize=8)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8, frameon=True)
     ax.grid(axis="y", alpha=0.3)
+    ax.margins(x=0.15)  # extra horizontal padding so x-tick labels don't crowd bars
     fig.tight_layout()
     fig.savefig(run_dir / "collectives_breakdown.png", dpi=dpi, bbox_inches="tight")
     plt.close(fig)

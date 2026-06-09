@@ -267,6 +267,23 @@ class FSDP2Engine:
             offload_policy=CPUOffloadPolicy(pin_memory=self.pin_memory) if self.offload_params else None,
         )
 
+        # Experimental: opt into FSDP2's async-op all-gather path. This issues
+        # the unshard collective with async_op=True so the all-gather
+        # allocation lands on the default stream (avoiding inter-stream
+        # fragmentation) but trades some forward overlap unless explicit
+        # prefetching is used. Gated behind an env var so we can A/B without
+        # touching code; see the FSDP2 docstring on _set_unshard_async_op for
+        # the trade-off.
+        if os.environ.get("LLAMAFACTORY_FSDP2_UNSHARD_ASYNC_OP", "0") == "1":
+            try:
+                model._set_unshard_async_op(True)
+                logger.info_rank0("FSDP2: unshard_async_op enabled via LLAMAFACTORY_FSDP2_UNSHARD_ASYNC_OP=1")
+            except AttributeError:
+                logger.warning_rank0(
+                    "FSDP2: _set_unshard_async_op not available in this torch build; ignoring "
+                    "LLAMAFACTORY_FSDP2_UNSHARD_ASYNC_OP=1"
+                )
+
         return model
 
     @torch.no_grad()

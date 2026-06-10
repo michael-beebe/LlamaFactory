@@ -124,6 +124,107 @@ if [[ -n "${TORCHCOMMS_BACKEND_LIB_PATH_NCCL:-}" ]]; then
 fi
 echo
 
+# Snapshot every input that could affect the result of this bench run so a
+# `runs/<timestamp>/` directory is self-describing and reproducible long after
+# the fact. Writes a top-level run_config.txt with: bench params, env vars,
+# git revs of both repos, GPU/driver/CUDA/torch versions, and the full content
+# of the LlamaFactory YAML being trained against.
+write_run_config() {
+    local f="${RUN_DIR}/run_config.txt"
+    local mscclpp_root="${REPO_ROOT}/.."
+    {
+        echo "# Bench run config"
+        echo "# Written by michaelbeebe/bench/run.sh at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo
+        echo "== Run identity =="
+        echo "  run_dir          : ${RUN_DIR}"
+        echo "  timestamp        : ${TIMESTAMP}"
+        echo "  host             : $(hostname)"
+        echo "  user             : $(whoami)"
+        echo "  pwd              : $(pwd)"
+        echo
+        echo "== Bench parameters =="
+        echo "  NPROC            : ${NPROC}"
+        echo "  STEPS            : ${STEPS}"
+        echo "  WARMUP           : ${WARMUP}"
+        echo "  CONFIG           : ${CONFIG}"
+        echo "  SKIP_NCCL_BASELINE   : ${SKIP_NCCL_BASELINE:-0}"
+        echo "  SKIP_NCCL_TORCHCOMMS : ${SKIP_NCCL_TORCHCOMMS:-0}"
+        echo
+        echo "== Backend .so paths =="
+        echo "  TORCHCOMMS_BACKEND_LIB_PATH_MSCCLPP : ${TORCHCOMMS_BACKEND_LIB_PATH_MSCCLPP:-<unset>}"
+        echo "  TORCHCOMMS_BACKEND_LIB_PATH_NCCL    : ${TORCHCOMMS_BACKEND_LIB_PATH_NCCL:-<unset>}"
+        echo "  MSCCLPP_NCCL_SHIM                    : ${MSCCLPP_NCCL_SHIM:-<unset>}"
+        echo
+        echo "== Relevant env vars =="
+        echo "  LLAMAFACTORY_FSDP2_UNSHARD_ASYNC_OP : ${LLAMAFACTORY_FSDP2_UNSHARD_ASYNC_OP:-<unset>}"
+        echo "  MSCCLPP_TORCHCOMMS_TRACE             : ${MSCCLPP_TORCHCOMMS_TRACE:-1 (default)}"
+        echo "  CUDA_VISIBLE_DEVICES                 : ${CUDA_VISIBLE_DEVICES:-<unset>}"
+        echo "  NCCL_DEBUG (will be overridden)      : ${NCCL_DEBUG:-<unset>}"
+        echo
+        echo "== Git: LlamaFactory (${REPO_ROOT}) =="
+        if git -C "${REPO_ROOT}" rev-parse --git-dir > /dev/null 2>&1; then
+            echo "  branch  : $(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+            echo "  commit  : $(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null)"
+            echo "  short   : $(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null)"
+            echo "  dirty   : $(git -C "${REPO_ROOT}" status --porcelain 2>/dev/null | wc -l) modified files"
+            echo "  remote  : $(git -C "${REPO_ROOT}" config --get remote.origin.url 2>/dev/null)"
+        else
+            echo "  <not a git repo>"
+        fi
+        echo
+        echo "== Git: mscclpp (${mscclpp_root}) =="
+        if git -C "${mscclpp_root}" rev-parse --git-dir > /dev/null 2>&1; then
+            echo "  branch  : $(git -C "${mscclpp_root}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+            echo "  commit  : $(git -C "${mscclpp_root}" rev-parse HEAD 2>/dev/null)"
+            echo "  short   : $(git -C "${mscclpp_root}" rev-parse --short HEAD 2>/dev/null)"
+            echo "  dirty   : $(git -C "${mscclpp_root}" status --porcelain 2>/dev/null | wc -l) modified files"
+            echo "  remote  : $(git -C "${mscclpp_root}" config --get remote.origin.url 2>/dev/null)"
+        else
+            echo "  <not a git repo>"
+        fi
+        echo
+        echo "== Software stack =="
+        echo "  OS              : $(uname -srm)"
+        echo "  python          : $(python3 --version 2>&1)"
+        # Versions of the heavy hitters we care about. Best-effort — silently
+        # falls back to "<not importable>" if the bench env lacks one of them.
+        python3 - <<'PY' 2>/dev/null || true
+import importlib
+for mod in ("torch", "torchcomms", "mscclpp", "transformers", "llamafactory"):
+    try:
+        m = importlib.import_module(mod)
+        v = getattr(m, "__version__", "<no __version__>")
+        print(f"  {mod:<15} : {v}")
+    except Exception as e:
+        print(f"  {mod:<15} : <not importable: {type(e).__name__}>")
+try:
+    import torch
+    print(f"  torch.cuda      : {torch.version.cuda}")
+    print(f"  torch.nccl      : {'.'.join(str(x) for x in torch.cuda.nccl.version())}")
+except Exception:
+    pass
+PY
+        echo
+        echo "== GPUs (nvidia-smi) =="
+        if command -v nvidia-smi > /dev/null 2>&1; then
+            nvidia-smi --query-gpu=index,name,driver_version,memory.total,compute_cap --format=csv 2>&1 | sed 's/^/  /'
+        else
+            echo "  <nvidia-smi unavailable>"
+        fi
+        echo
+        echo "== LlamaFactory YAML config (${CONFIG}) =="
+        if [[ -f "${REPO_ROOT}/${CONFIG}" ]]; then
+            sed 's/^/  /' "${REPO_ROOT}/${CONFIG}"
+        else
+            echo "  <not found at ${REPO_ROOT}/${CONFIG}>"
+        fi
+    } > "${f}"
+    echo "  wrote ${f}"
+}
+write_run_config
+echo
+
 run_one() {
     local label="$1"
     # Backend selector: "" → plain torch.distributed NCCL (no torchcomms);
@@ -131,6 +232,41 @@ run_one() {
     local backend="$2"
     local out_dir="${RUN_DIR}/${label}"
     mkdir -p "${out_dir}/per_rank" "${out_dir}/nccl_logs"
+
+    # Per-run config snapshot: the exact env vars and command used for this
+    # backend. Useful when you want to manually re-run one config from a
+    # historical run dir without rerunning the whole 3-way comparison.
+    {
+        echo "# Per-run config for ${label}"
+        echo "# Written at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo
+        echo "label   : ${label}"
+        echo "backend : ${backend:-stock-nccl (plain torch.distributed)}"
+        echo
+        echo "== Env vars passed to torchrun =="
+        echo "  LLAMAFACTORY_TORCHCOMMS_BACKEND     : ${backend}"
+        echo "  LLAMAFACTORY_FSDP2_UNSHARD_ASYNC_OP : ${LLAMAFACTORY_FSDP2_UNSHARD_ASYNC_OP:-<unset>}"
+        echo "  MSCCLPP_TORCHCOMMS_TRACE             : ${MSCCLPP_TORCHCOMMS_TRACE:-1 (default)}"
+        echo "  NCCL_DEBUG                           : INFO"
+        echo "  NCCL_DEBUG_SUBSYS                    : TUNING"
+        echo "  NCCL_DEBUG_FILE                      : ${out_dir}/nccl_logs/nccl_%h_%p.log"
+        echo "  BENCH_TIMING_PATH                    : ${out_dir}/step_timings.jsonl"
+        echo "  TORCHCOMMS_BACKEND_LIB_PATH_MSCCLPP : ${TORCHCOMMS_BACKEND_LIB_PATH_MSCCLPP:-<unset>}"
+        echo "  TORCHCOMMS_BACKEND_LIB_PATH_NCCL    : ${TORCHCOMMS_BACKEND_LIB_PATH_NCCL:-<unset>}"
+        echo "  PYTHONPATH                           : ${BENCH_DIR}/..:${PYTHONPATH:-}"
+        echo
+        echo "== Command =="
+        echo "  torchrun \\"
+        echo "    --nproc_per_node=${NPROC} \\"
+        echo "    --rdzv_backend c10d \\"
+        echo "    --rdzv_endpoint=localhost:0 \\"
+        echo "    --redirects 3 \\"
+        echo "    --log-dir ${out_dir}/per_rank \\"
+        echo "    --tee 0 \\"
+        echo "    ${BENCH_DIR}/timing_runner.py \\"
+        echo "    ${CONFIG} \\"
+        echo "    max_steps=${STEPS}"
+    } > "${out_dir}/config.txt"
 
     echo "== Running: ${label} (backend=${backend:-stock-nccl}) =="
     # Override max_steps from CLI; trace is always on so we can parse algo selection.

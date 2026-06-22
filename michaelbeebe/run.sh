@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Run: LLAMAFACTORY_FSDP2_UNSHARD_ASYNC_OP=1 NPROC=8 STEPS=200 WARMUP=20 ./run.sh
+
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
